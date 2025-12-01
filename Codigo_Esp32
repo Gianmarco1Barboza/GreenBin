@@ -1,0 +1,260 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+const char* ssid = "RED_WIFI";
+const char* password = "PASSWORD_WIFI";
+
+const char* apexHost = "oracleapex.com";
+const char* apexPath = "ords/greenbin/lecturas/insert";   
+const int microID = 1;
+WiFiClientSecure https;
+
+const int trigPin = 4;
+const int echoPin = 2;
+const int redPin = 15;
+const int greenPin = 13;
+const int bluePin = 12;
+
+Servo miServo;
+const int servoPin = 14;
+const int botonPin = 23;
+
+#define DHTPIN 26         
+#define DHTTYPE DHT11     
+DHT dht(DHTPIN, DHTTYPE);
+
+#define MQ135_PIN 34      
+float gasLevel = 0.0;
+
+#define PIR_PIN 25        
+
+MPU6050 mpu;
+int16_t ax, ay, az;
+int giroState = 0;
+
+volatile int motionCount = 0; 
+volatile unsigned long lastMotionTime = 0; 
+
+long duration;
+float distance_cm;
+float temperature = NAN;
+float humidity = NAN;
+
+const unsigned long SEND_PERIOD_MS = 15000;
+const int MAX_SENDS = 50; 
+const int MAX_MOTION_BURST = 10;
+
+unsigned long lastSend = 0;
+unsigned long nextSend = 0;
+int sendsDone = 0;
+
+enum DataType {DISTANCE, TEMPERATURE, HUMIDITY, GAS, GIRO, MOTION};
+DataType currentData = DISTANCE; 
+
+void IRAM_ATTR detectsMovement() {
+  unsigned long now = millis();
+  if (now - lastMotionTime > 3500) { 
+    motionCount++;
+    lastMotionTime = now;
+  }
+}
+
+void setLED(int r, int g, int b) {
+  analogWrite(redPin, r);
+  analogWrite(greenPin, g);
+  analogWrite(bluePin, b);
+}
+
+long getDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  duration = pulseIn(echoPin, HIGH, 30000UL);
+  if (duration == 0) return -1;
+  return (long)(duration * 0.034 / 2.0); 
+}
+
+bool connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(200);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool sendToAPEX(const char* tipo, float valor) {
+  if (!connectWiFi()) return false;
+
+  https.setInsecure(); 
+  if (!https.connect(apexHost, 443)) return false;
+
+  String strValor;
+  if (String(tipo) == "Movimiento" || String(tipo) == "girobote") {
+    strValor = String((int)valor); 
+  } else {
+    strValor = String(valor, 2);
+  }
+
+  String url = "https://" + String(apexHost) + "/" + String(apexPath) + "?microval=" + String(microID) + "&datoval=" + String(tipo) + "&valorval=" + strValor;
+  
+  https.println("GET " + url + " HTTP/1.1");
+  https.println("Host: " + String(apexHost));
+  https.println("Connection: close");
+  https.println();
+
+  while (https.connected()) {
+    String line = https.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break;
+  }
+  String payload = "";
+  while (https.available()) { payload += https.readString(); }
+  https.stop();
+
+  Serial.print("[APEX] Enviado: ");
+  Serial.print(tipo);
+  Serial.print(" = ");
+  Serial.println(strValor);
+
+  return (payload.indexOf("success") != -1 || payload.length() > 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+  pinMode(MQ135_PIN, INPUT);
+  
+  miServo.attach(servoPin, 500, 2400);
+  pinMode(botonPin, INPUT_PULLUP);
+
+  pinMode(PIR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIR_PIN), detectsMovement, RISING);
+
+  Wire.begin(18, 19);
+  mpu.initialize();     
+  if (!mpu.testConnection()) {
+    Serial.println("Error: No se pudo conectar al MPU6050");
+  } else {
+    Serial.println("MPU6050 conectado.");
+  }
+
+  setLED(0, 0, 0);
+  dht.begin();
+  
+  Serial.println("--- INICIANDO SISTEMA INTEGRADO ---");
+  connectWiFi();
+
+  lastSend = millis();
+  nextSend = lastSend + SEND_PERIOD_MS;
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  int estadoBoton = digitalRead(botonPin);
+
+  if (estadoBoton == LOW) {  
+    miServo.write(120);
+  } else {
+    miServo.write(140);
+  }
+
+  float d = (float)getDistance();
+  distance_cm = d;
+
+  if (d < 0) setLED(0, 0, 64);
+  else if (d <= 5) setLED(255, 0, 0);
+  else if (d <= 10) setLED(144, 255, 0);
+  else setLED(0, 255, 0);
+
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+  gasLevel = analogRead(MQ135_PIN);
+
+  if (mpu.testConnection()) {
+    mpu.getAcceleration(&ax, &ay, &az);
+    giroState = (abs(az) >= 14900) ? 0 : 1;
+  }
+
+  if (sendsDone < MAX_SENDS && now >= nextSend) {
+    
+    switch (currentData) {
+      case DISTANCE:
+        sendToAPEX("Distancia", (d < 0) ? 0 : d);
+        currentData = TEMPERATURE;
+        nextSend = now + 3000; 
+        break;
+
+      case TEMPERATURE:
+        sendToAPEX("Temperatura", (isnan(temperature)) ? 0 : temperature);
+        currentData = HUMIDITY;
+        nextSend = now + 3000; 
+        break;
+
+      case HUMIDITY:
+        sendToAPEX("Humedad", (isnan(humidity)) ? 0 : humidity);
+        currentData = GAS;
+        nextSend = now + 3000; 
+        break;
+
+      case GAS:
+        sendToAPEX("Gas", gasLevel);
+        currentData = GIRO;
+        nextSend = now + 3000; 
+        break;
+
+      case GIRO:
+        if (mpu.testConnection()) {
+          sendToAPEX("girobote", (float)giroState);
+        }
+        currentData = MOTION;
+        nextSend = now + 2000; 
+        break;
+
+      case MOTION: {
+        Serial.println("--------------------------------");
+        Serial.print(">>> Finalizando ciclo. Movimientos acumulados: ");
+        Serial.println(motionCount);
+
+        int movimientosAEnviar = motionCount;
+        motionCount = 0; 
+        
+        if (movimientosAEnviar > 0) {
+          if (movimientosAEnviar > MAX_MOTION_BURST) movimientosAEnviar = MAX_MOTION_BURST;
+
+          Serial.print(">>> Enviando ráfaga de ");
+          Serial.print(movimientosAEnviar);
+          Serial.println(" registros...");
+
+          for (int i = 0; i < movimientosAEnviar; i++) {
+             sendToAPEX("Movimiento", 1.0); 
+             delay(200);
+          }
+        } else {
+          Serial.println("[PIR] Sin movimiento. No se envían datos.");
+        }
+
+        currentData = DISTANCE; 
+        nextSend = now + 15000;
+        sendsDone++; 
+        Serial.println("--- Esperando 15s para siguiente ciclo ---");
+        break;
+      }
+    }
+  }
+  
+  delay(50);
+}
